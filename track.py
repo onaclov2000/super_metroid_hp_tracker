@@ -4,78 +4,22 @@ import psutil
 import json
 import datetime
 import struct
+# Lots of help from: 
+# https://jathys.zophar.net/supermetroid/kejardon/RAMMap.txt
+# https://raw.githubusercontent.com/UNHchabo/AutoSplitters/master/SuperMetroid/LiveSplit.SuperMetroid.asl
+# https://docs.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-readprocessmemory
+# https://docs.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights (PROCESS_VM_READ (0x0010)	Required to read memory in a process using ReadProcessMemory.)
+# https://wiki.supermetroid.run/index.php?title=List_of_rooms_by_SMILE_ID
+# https://github.com/Stashiocat/stashiobot/blob/master/utils/supermetroid.py
 
+SAMUS_HP = 0x09C2 # Samus's HP, useful for comparing samus HP vs enemy HP over a gameplay.
+ENEMY_HP =  0X0f8c # Where to find the enemy HP (This doesn't support MB and whatnot, so I'll want to improve that at some point.)
+ROOMID = 0X079B # Location of Room identifiers
+MISSILES = 0x09C6
+SUPER_MISSILES = 0x09CA
+POWER_BOMBS = 0x09CE
 
-
-# first get pid, see the 32-bit solution
-
-
-'''
-mem_info
-pmem(rss=189407232, 
-     vms=222834688, 
-     num_page_faults=1957011, 
-     peak_wset=229617664, 
-     wset=189407232, 
-     peak_paged_pool=625096, 
-     paged_pool=553800, 
-     peak_nonpaged_pool=38248, 
-     nonpaged_pool=37296, 
-     pagefile=222834688, 
-     peak_pagefile=233480192, 
-     private=222834688)
-
-mem_info_ex
-pmem(rss=143306752, 
-     vms=223154176, 
-     num_page_faults=1961048, 
-     peak_wset=229617664, 
-     wset=143306752, 
-     peak_paged_pool=625096, 
-     paged_pool=554056, 
-     peak_nonpaged_pool=38248, 
-     nonpaged_pool=37296, 
-     pagefile=223154176, 
-     peak_pagefile=233480192, 
-     private=223154176)
-
-
-'''
-
-'''
-game
-  sha256:   34937741e0dbae5e3fa7fa92ecf8159b5b3fc9aba047a5dd8ae3c8cb1bcce345
-  label:    SMI_Practice_Hack
-  name:     SMI_Practice_Hack
-  title:    Super Metroid
-  region:   NTSC
-  revision: 1.0
-  board:    LOROM-RAM
-    memory
-      type: ROM
-      size: 0X400000
-      content: Program
-    memory
-      type: RAM
-      size: 0X8000
-      content: Save
-
-board: LOROM-RAM
-  memory
-    type:ROM
-    content:Program
-    map
-      address:00-7d,80-ff:8000-ffff
-      mask:0X8000
-  memory
-    type:RAM
-    content:Save
-    map
-      address:70-7d,f0-ff:0000-7fff
-      mask:0X8000
-'''
-rooms = {None: None,
-        "0X91F8" : "landingSite",
+rooms = {"0X91F8" : "landingSite",
         "0X93AA" : "crateriaPowerBombRoom",
         "0X93FE" : "westOcean",
         "0X94CC" : "elevatorToMaridia",
@@ -216,36 +160,28 @@ rooms = {None: None,
         "0XDEDE": "tourianEscape4",
         "0XDF45" : "ceresElevator",
         "0XE06B" : "flatRoom", # Placeholder name for the flat room in Ceres Station
-        "0XE0B5" : "ceresRidley" }
-        
+        "0XE0B5" : "ceresRidley",
+        "0X9FBA" : "noobbridge" }
+
+# Find the process we care about.        
 for proc in psutil.process_iter():
-    if "bsnes" in proc.name():
+    if "bsnes" in proc.name(): # This really only works if there is a single instance of bsnes, now we *could* set it up so it creates a whole thing for each one it finds, and then we print out which one was which (by pid)
         PROCESS_ID = proc.pid
+# Setup the base address we care about
+PROCESS_HEADER_ADDR = 0XB16D7C # Wanna use a different emulator? Pick out the second of the tuple found in the .asl link above (if you search for bsnes you should see it)
+# This value is so we can read the memory
+PROCESS_VM_READ = 0X0010 
 
-
-PROCESS_HEADER_ADDR = 0XB16D7C  #0XB15D7C
-
-STRLEN = 2
-
-PROCESS_VM_READ = 0X0010 #0X079B
-
-
-# Some/most of the below will/should be removed, but I don't feel like cleaning up at the moment.
+# Found this on stack overflow, so yea, I'm not 100% sure what is what, and what is necessary
 k32 = WinDLL('kernel32')
 k32.OpenProcess.argtypes = DWORD,BOOL,DWORD
 k32.OpenProcess.restype = HANDLE
 k32.ReadProcessMemory.argtypes = HANDLE, LPVOID, LPVOID, c_size_t, POINTER(c_size_t)
 k32.ReadProcessMemory.restype = BOOL
-
+# We need to open the process, so we pick the permissions, and the pid. (I don't recall what the middle parameter is)
 process = k32.OpenProcess(PROCESS_VM_READ, 0, PROCESS_ID)
-buf = create_string_buffer(STRLEN)
-s = c_size_t()
-#while True:
-tmp_1 = ""
-if k32.ReadProcessMemory(process,PROCESS_HEADER_ADDR + 0X079B, buf, STRLEN, byref(s)):
-    #print(s.value, buf.raw)
-    tmp_1 = buf.raw
 
+# Depending on how many bytes need to be read, we pick the appropriate datatype.
 def __alloc_mem( num_bytes):
         if num_bytes == 1:
             return c_ubyte()
@@ -256,83 +192,72 @@ def __alloc_mem( num_bytes):
         elif num_bytes == 8:
             return c_ulonglong()
 
-def read_room_name(length_of_data):
-    room_id = None
+def read_memory(offset, length_of_data):
     out_val = __alloc_mem(length_of_data)
-    bytesRead = c_ulonglong()
+    bytesRead = __alloc_mem(8) # No idea why it's c_ulonglong() here vs the earlier is a variable amount, but oh well.
     
-    r = windll.kernel32.ReadProcessMemory(process, PROCESS_HEADER_ADDR + 0X079B, byref(out_val), sizeof(out_val), byref(bytesRead))
-    room_id = str(hex(out_val.value)).upper()
-    room = rooms.get(room_id, "Room Not Found")
-    if room is None:
-        print (room_id, "Not Found")
+    r = windll.kernel32.ReadProcessMemory(process, PROCESS_HEADER_ADDR + offset, byref(out_val), sizeof(out_val), byref(bytesRead))
+    return out_val.value
+
+def read_enemy_hp(room):
+    # Do some checking which room we are in, if we are in certain rooms we will care about mother brain segments, etc
+    out_val = read_memory(ENEMY_HP, 2)
+    pass
+
+def read_room_name():
+    out_val = read_memory(ROOMID, 2)
+    room_id = str(hex(out_val)).upper()
+    room = rooms.get(room_id, "Room Not Found: " + room_id)
+    # The below is for tracking purposes.
+    #if room == "Room Not Found":
+    #    print (room_id, "Not Found")
     return room
 
-def read_enemy_hp(length_of_data):
-    out_val = __alloc_mem(length_of_data)
-    bytesRead = c_ulonglong()
-    r = windll.kernel32.ReadProcessMemory(process, PROCESS_HEADER_ADDR + 0X0f8c, byref(out_val), sizeof(out_val), byref(bytesRead))
-    room_id = out_val.value
-    return room_id
 
-
-def read_samus_hp(length_of_data):
-    out_val = __alloc_mem(length_of_data)
-    bytesRead = c_ulonglong()
-    
-    r = windll.kernel32.ReadProcessMemory(process, PROCESS_HEADER_ADDR + 0x09C2, byref(out_val), sizeof(out_val), byref(bytesRead))
-    room_id = out_val.value
-    return room_id
-   
-def read_samus_missiles(length_of_data):
-    out_val = __alloc_mem(length_of_data)
-    bytesRead = c_ulonglong()
-    
-    r = windll.kernel32.ReadProcessMemory(process, PROCESS_HEADER_ADDR + 0x09C6, byref(out_val), sizeof(out_val), byref(bytesRead))
-    room_id = out_val.value
-    return room_id
-    
 last_room = 0
 last_hp = 0
 samus_hp = 0
 change = False
 last_missiles = 0
+last_super_missiles = 0
+last_pb = 0
 while True:
-    current_room = read_room_name(2)
+    current_room = read_room_name()
     if last_room != current_room:
-       print (current_room)
+       print ("Room: ",current_room)
        last_room = current_room
        change = True
-    current_hp = read_enemy_hp(2)
+    current_hp = read_memory(ENEMY_HP, 2)
     if last_hp != current_hp:
-        print (current_hp)
+        print ("Enemy HP", current_hp)
         last_hp = current_hp
         change = True
-    current_samus_hp = read_samus_hp(1)
+    current_samus_hp = read_memory(SAMUS_HP, 1)
     if samus_hp != current_samus_hp:
-        print (current_samus_hp)
+        print ("Samus HP", current_samus_hp)
         samus_hp = current_samus_hp
         change = True
-    current_missiles = read_samus_missiles(2)
+    current_missiles = read_memory(MISSILES ,2)
     if last_missiles != current_missiles:
-        print (current_missiles)
+        print ("Missile Count: ", current_missiles)
         last_missiles = current_missiles
         change = True
+
+    current_super_missiles = read_memory(SUPER_MISSILES,2)
+    if last_super_missiles != current_super_missiles:
+        print ("Super Missile Count: ", current_super_missiles)
+        last_super_missiles = current_super_missiles
+        change = True
+
+    current_pb = read_memory(POWER_BOMBS,2)
+    if last_pb != current_pb:
+        print ("PB Count: ", current_pb)
+        last_pb = current_pb
+        change = True
+
     if change:
         # write to disk
         f = open("activity_tracker.txt", 'a')
-        f.write(json.dumps({"room" : current_room,"missiles" : current_missiles, "bosshp" : current_hp, "samushp" : current_samus_hp, "date" : str(datetime.datetime.now())}) + "\n")
+        f.write(json.dumps({"room" : current_room,"missiles" : current_missiles, "bosshp" : current_hp, "samushp" : current_samus_hp, "powerbombs" : current_pb,"supermissiles" : current_super_missiles, "date" : str(datetime.datetime.now())}) + "\n")
         f.close()
         change = False
-
-
-# Check for room id
-
-# Enemy HP offset: offset + 0X0F8C
-# Room ID: offset + 0X079B
-# I want to do something like the below
-#if room["kraid"] == RoomID or room["phantoon"] == RoomID or
-#   room["ridley"] == RoomID or room["draygon"] == RoomID or 
-#   room["crocomire"] == RoomID or room["sporespawn"] == RoomID or
-#   room["Golden Torizo"] == RoomID or room["botwoon"] == RoomID: # Makesure we are in a boss fight
-#    append_to_file.write(json.dumps({"datetime" : datetime, "boss" : room_lookup[RoomID], "hp" : hp}))
